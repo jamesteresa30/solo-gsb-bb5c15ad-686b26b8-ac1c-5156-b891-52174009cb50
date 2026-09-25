@@ -12,7 +12,10 @@
 - **单向航道预约**：在请求方允许的出发时刻范围内，按最新预报安排**最早**出发时刻，
   使整个通航过程不与该港口现有**有效预约**重叠（两船**首尾相接允许**）；
   无可用时刻返回 **409** 且不写入；同港口并发创建原子地“检查 + 落库”，杜绝双重占用；
-- 已落库预约记录的是排定的确定时刻，**预报更正不追溯调整或取消已有预约**。
+- 已落库预约记录的是排定的确定时刻，**预报更正不追溯调整或取消已有预约**；
+- **预约水深复核**：`GET /reservations/{id}/depth-audit` 按**查询时最新预报**复算
+  预约排定通航区间的水深，合并返回欠深时段及各段**最大欠深**；预报首末点未覆盖
+  整个通航区间时明确返回未覆盖时段且**不判为安全**；复核**只读**，不改动预约或原排程。
 
 ## 快速开始（单条命令）
 
@@ -54,6 +57,7 @@ docker compose up --build
 | `POST` | `/ports/{id}/reservations` | 创建单向航道预约（自动排最早出发时刻） |
 | `GET` | `/ports/{id}/reservations` | 按港口列出**有效**预约（按出发时刻升序） |
 | `DELETE` | `/reservations/{id}` | 取消预约（释放航道占用） |
+| `GET` | `/reservations/{id}/depth-audit` | 预约水深复核：按最新预报复算排定通航区间水深（只读） |
 
 ### 完整示例
 
@@ -196,6 +200,73 @@ curl -X DELETE http://localhost:8000/reservations/1
 - 创建预约的校验与 `/windows` 一致（通航时长为正、吃水/富余非负），
   此外允许出发范围起止颠倒返回 422，港口不存在返回 404。
 
+## 预约水深复核
+
+`GET /reservations/{id}/depth-audit`（服务默认监听 **8000** 端口）对已排定的预约
+做**只读**水深复核：
+
+- 读取预约排定的通航起止（`departure_start` / `departure_end`）、吃水与安全富余，
+  按该港口**查询时刻的最新预报**相邻点线性插值复算水深；
+- `deficits`：通航区间内水深低于所需水深（吃水 + 安全富余）的连续时段，
+  相邻段已合并，并给出各段**最大欠深**（所需水深 − 时段内最低水深）；
+- 预报首末点未覆盖整个通航区间时，`coverage_complete` 为 `false`，
+  `uncovered` 列出未覆盖时段——这些时段水深未知，**不判为安全**，
+  此时 `sufficient` 一律为 `false`；
+- 结果只反映查询时的预报，**不改动预约或原排程**；预约不存在返回 404，
+  已取消的预约也可复核（`status` 为 `cancelled`）。
+
+```bash
+# 复核预约 1（沿用上文示例：甲船排定 00:36–01:36，所需水深 5.5 米）
+curl http://localhost:8000/reservations/1/depth-audit
+```
+
+预报未变时，排定区间内水深全程达标：
+
+```json
+{
+  "reservation_id": 1,
+  "port_id": 1,
+  "ship_name": "甲船",
+  "status": "active",
+  "departure_start": "2026-09-24T00:36:00+00:00",
+  "departure_end": "2026-09-24T01:36:00+00:00",
+  "draft": 5.0,
+  "safety_margin": 0.5,
+  "required_depth": 5.5,
+  "coverage_complete": true,
+  "uncovered": [],
+  "deficits": [],
+  "sufficient": true
+}
+```
+
+若 03:00 的预报点被更正为 1.0（见上文"完整示例"第 4 步），同一预约复核即
+发现全程欠深（00:36 处欠 0.4 米），但预约本身的排定时刻不受影响：
+
+```json
+{
+  "reservation_id": 1,
+  "port_id": 1,
+  "ship_name": "甲船",
+  "status": "active",
+  "departure_start": "2026-09-24T00:36:00+00:00",
+  "departure_end": "2026-09-24T01:36:00+00:00",
+  "draft": 5.0,
+  "safety_margin": 0.5,
+  "required_depth": 5.5,
+  "coverage_complete": true,
+  "uncovered": [],
+  "deficits": [
+    {"start": "2026-09-24T00:36:00+00:00", "end": "2026-09-24T01:36:00+00:00", "max_deficit": 0.4}
+  ],
+  "sufficient": false
+}
+```
+
+若最新预报只覆盖到 01:00（首末点未覆盖整个通航区间），则返回
+`coverage_complete: false`、`uncovered: [{"start": "…01:00…", "end": "…01:36…"}]`
+且 `sufficient: false`——覆盖不足**不会**被当作安全。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -210,7 +281,7 @@ pytest                                # 运行全部测试（核心算法 + API 
 ```
 app/
   main.py       # FastAPI 路由与生命周期（启动时初始化数据库）
-  tides.py      # 核心算法：线性插值、达标窗口、可出发时段
+  tides.py      # 核心算法：线性插值、达标窗口、可出发时段、水深复核
   database.py   # SQLite 连接与幂等建表
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/

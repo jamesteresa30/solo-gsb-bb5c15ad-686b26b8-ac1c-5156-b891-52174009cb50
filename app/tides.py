@@ -5,7 +5,9 @@
 - 相邻预报点之间潮高按线性插值；
 - 只在预报覆盖时段 [首个预报点, 末个预报点] 内计算；
 - 水深 >= 吃水 + 安全富余 的连续时段为达标窗口，端点恰好达标也纳入；
-- 可出发时段 = [窗口起点, 窗口终点 − 通航时长]；窗口长度不足通航时长的舍弃。
+- 可出发时段 = [窗口起点, 窗口终点 − 通航时长]；窗口长度不足通航时长的舍弃；
+- 预约水深复核：在排定通航区间内求水深低于所需水深的连续时段（相邻段合并，
+  附各段最大欠深）；预报首末点未覆盖的通航时段单独返回，不得视为安全。
 """
 from __future__ import annotations
 
@@ -140,6 +142,97 @@ def earliest_scheduled_departure(
     if not candidates:
         return None
     return _to_utc(min(lo for lo, _ in candidates))
+
+
+def depth_deficit_audit(
+    points: list[ForecastPoint],
+    reference_depth: float,
+    required_depth: float,
+    start: datetime,
+    end: datetime,
+) -> tuple[list[tuple[datetime, datetime, float]], list[tuple[datetime, datetime]]]:
+    """复核通航区间 [start, end] 的水深（按最新预报相邻点线性插值）。
+
+    返回 (deficits, uncovered)：
+    - deficits：通航区间内水深低于 required_depth 的连续时段
+      [(起点, 终点, 最大欠深)]，跨预报点的连续欠深已合并，
+      最大欠深 = required_depth − 时段内最低水深；
+    - uncovered：预报首末点未覆盖的通航时段 [(起点, 终点)]，
+      这些时段水深未知，调用方不得据此判为安全。
+    """
+    start_ts = start.timestamp()
+    end_ts = end.timestamp()
+
+    if len(points) < 2:
+        # 无插值区间：整个通航区间都未被预报覆盖
+        uncovered = [(start, end)] if start_ts < end_ts else []
+        return [], uncovered
+
+    ts = [p[0].timestamp() for p in points]
+    depths = [reference_depth + p[1] for p in points]
+    first_ts, last_ts = ts[0], ts[-1]
+
+    uncovered_ts: list[tuple[float, float]] = []
+    if start_ts < min(end_ts, first_ts):  # 通航起点早于首个预报点
+        uncovered_ts.append((start_ts, min(end_ts, first_ts)))
+    if max(start_ts, last_ts) < end_ts:  # 通航终点晚于末个预报点
+        uncovered_ts.append((max(start_ts, last_ts), end_ts))
+
+    lo = max(start_ts, first_ts)
+    hi = min(end_ts, last_ts)
+
+    deficits_ts: list[tuple[float, float, float]] = []
+    cur_start: float | None = None
+    cur_end: float | None = None
+    cur_max = 0.0
+
+    def flush() -> None:
+        nonlocal cur_start, cur_end, cur_max
+        if cur_start is not None:
+            deficits_ts.append((cur_start, cur_end, round(cur_max, 6)))  # type: ignore[arg-type]
+            cur_start = cur_end = None
+            cur_max = 0.0
+
+    for i in range(len(points) - 1):
+        t0, t1 = ts[i], ts[i + 1]
+        a, b = max(t0, lo), min(t1, hi)  # 插值段与通航区间（覆盖范围内）的交集
+        if a >= b:
+            continue
+        # 线性插值出交集端点处的水深
+        d0 = depths[i] + (depths[i + 1] - depths[i]) * (a - t0) / (t1 - t0)
+        d1 = depths[i] + (depths[i + 1] - depths[i]) * (b - t0) / (t1 - t0)
+        below0 = d0 < required_depth - _EPS
+        below1 = d1 < required_depth - _EPS
+
+        if not below0 and not below1:
+            # 线性段两端都不欠深，整段达标；关闭当前欠深时段
+            flush()
+            continue
+        if below0 and below1:
+            seg = (a, b)
+            seg_max = required_depth - min(d0, d1)
+        elif below0:
+            seg = (a, _cross_time(a, d0, b, d1, required_depth))
+            seg_max = required_depth - d0
+        else:
+            seg = (_cross_time(a, d0, b, d1, required_depth), b)
+            seg_max = required_depth - d1
+
+        if cur_start is None:
+            cur_start, cur_end, cur_max = seg[0], seg[1], seg_max
+        elif seg[0] <= cur_end + 1e-6:  # type: ignore[operator]
+            # 相邻段首尾相接（如共享的预报点同样欠深），合并为同一连续欠深时段
+            cur_end = max(cur_end, seg[1])  # type: ignore[type-var]
+            cur_max = max(cur_max, seg_max)
+        else:
+            flush()
+            cur_start, cur_end, cur_max = seg[0], seg[1], seg_max
+
+    flush()
+
+    deficits = [(_to_utc(s), _to_utc(e), m) for s, e, m in deficits_ts]
+    uncovered = [(_to_utc(s), _to_utc(e)) for s, e in uncovered_ts]
+    return deficits, uncovered
 
 
 def _to_utc(ts: float) -> datetime:

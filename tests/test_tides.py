@@ -1,7 +1,12 @@
 """核心窗口计算算法的单元测试（仅标准库）。"""
 from datetime import datetime, timedelta, timezone
 
-from app.tides import departure_windows, earliest_scheduled_departure, sufficient_depth_windows
+from app.tides import (
+    departure_windows,
+    depth_deficit_audit,
+    earliest_scheduled_departure,
+    sufficient_depth_windows,
+)
 
 BASE = datetime(2026, 9, 24, tzinfo=timezone.utc)
 
@@ -206,3 +211,113 @@ def test_schedule_range_touching_tide_window_endpoint_allowed():
         [],
     )
     assert dep == BASE + timedelta(hours=4)
+
+
+# ---------------------------------------------------------------------------
+# depth_deficit_audit：预约通航区间水深复核
+# ---------------------------------------------------------------------------
+
+
+def test_audit_single_deficit_segment_with_max_deficit():
+    # 基准 3，潮高 3→1→3：水深 6→4→6，要求 5；00:30 跌破，01:30 回升
+    deficits, uncovered = depth_deficit_audit(
+        pts(3, 1, 3), reference_depth=3.0, required_depth=5.0,
+        start=BASE, end=BASE + timedelta(hours=2),
+    )
+    assert uncovered == []
+    assert len(deficits) == 1
+    start, end, max_deficit = deficits[0]
+    assert start == BASE + timedelta(minutes=30)
+    assert end == BASE + timedelta(hours=1, minutes=30)
+    assert max_deficit == 1.0  # 最低水深 4.0（01:00），欠深 5 − 4 = 1
+
+
+def test_audit_merges_deficit_across_forecast_points():
+    # 水深 6→4.5→4→6：欠深段在欠深的预报点处相连，合并为一段，最大欠深取全段最低
+    deficits, uncovered = depth_deficit_audit(
+        pts(3, 1.5, 1, 3), reference_depth=3.0, required_depth=5.0,
+        start=BASE, end=BASE + timedelta(hours=3),
+    )
+    assert uncovered == []
+    assert len(deficits) == 1
+    start, end, max_deficit = deficits[0]
+    assert start == BASE + timedelta(minutes=40)   # 6→4.5 段在 00:40 跌破 5
+    assert end == BASE + timedelta(hours=2, minutes=30)  # 4→6 段在 02:30 回升到 5
+    assert max_deficit == 1.0
+
+
+def test_audit_two_separate_deficit_segments():
+    # 潮高 3,1,3,1,3（基准 3，要求 5）：两个独立低谷，各自成段
+    deficits, _ = depth_deficit_audit(
+        pts(3, 1, 3, 1, 3), reference_depth=3.0, required_depth=5.0,
+        start=BASE, end=BASE + timedelta(hours=4),
+    )
+    assert len(deficits) == 2
+    assert deficits[0][0] == BASE + timedelta(minutes=30)
+    assert deficits[0][1] == BASE + timedelta(hours=1, minutes=30)
+    assert deficits[1][0] == BASE + timedelta(hours=2, minutes=30)
+    assert deficits[1][1] == BASE + timedelta(hours=3, minutes=30)
+    assert [m for _, _, m in deficits] == [1.0, 1.0]
+
+
+def test_audit_exact_threshold_is_not_deficit():
+    # 水深在 01:00 恰好触及所需水深 5.0，不算欠深
+    deficits, uncovered = depth_deficit_audit(
+        pts(3, 2, 3), reference_depth=3.0, required_depth=5.0,
+        start=BASE, end=BASE + timedelta(hours=2),
+    )
+    assert deficits == []
+    assert uncovered == []
+
+
+def test_audit_clips_to_transit_interval():
+    # 只在通航区间内复核：通航 00:15–01:00，水深 4.5→6，00:30 起达标
+    deficits, uncovered = depth_deficit_audit(
+        pts(1, 3), reference_depth=3.0, required_depth=5.0,
+        start=BASE + timedelta(minutes=15), end=BASE + timedelta(hours=1),
+    )
+    assert uncovered == []
+    assert len(deficits) == 1
+    start, end, max_deficit = deficits[0]
+    assert start == BASE + timedelta(minutes=15)
+    assert end == BASE + timedelta(minutes=30)
+    assert max_deficit == 0.5
+
+
+def test_audit_forecast_not_covering_transit_head_and_tail():
+    # 预报只覆盖 [01:00, 02:00]，通航 [00:00, 03:00]：首尾各一段未覆盖
+    points = [
+        (BASE + timedelta(hours=1), 3.0),
+        (BASE + timedelta(hours=2), 3.0),
+    ]
+    deficits, uncovered = depth_deficit_audit(
+        points, reference_depth=3.0, required_depth=5.0,
+        start=BASE, end=BASE + timedelta(hours=3),
+    )
+    assert deficits == []  # 覆盖段内水深 6.0 达标
+    assert uncovered == [
+        (BASE, BASE + timedelta(hours=1)),
+        (BASE + timedelta(hours=2), BASE + timedelta(hours=3)),
+    ]
+
+
+def test_audit_without_forecast_points_all_uncovered():
+    start, end = BASE, BASE + timedelta(hours=1)
+    for points in ([], [(BASE, 5.0)]):  # 无预报点 / 单点无插值区间
+        deficits, uncovered = depth_deficit_audit(
+            points, reference_depth=3.0, required_depth=5.0, start=start, end=end,
+        )
+        assert deficits == []
+        assert uncovered == [(start, end)]
+
+
+def test_audit_deficit_stops_at_forecast_coverage_edge():
+    # 通航 [00:00, 02:00]，预报只覆盖 [00:00, 01:00] 且全程水深不足：
+    # 欠深段到预报末点为止，其余时段按未覆盖返回（不得视为安全）
+    points = [(BASE, 1.0), (BASE + timedelta(hours=1), 1.0)]
+    deficits, uncovered = depth_deficit_audit(
+        points, reference_depth=3.0, required_depth=5.0,
+        start=BASE, end=BASE + timedelta(hours=2),
+    )
+    assert deficits == [(BASE, BASE + timedelta(hours=1), 1.0)]
+    assert uncovered == [(BASE + timedelta(hours=1), BASE + timedelta(hours=2))]

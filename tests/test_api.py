@@ -1,4 +1,5 @@
 """API 端到端测试（需要 fastapi/httpx，容器内或安装依赖后运行）。"""
+import sqlite3
 import threading
 
 import pytest
@@ -284,3 +285,114 @@ def test_reservation_naive_datetime_treated_as_utc(client):
     r = client.post(f"/ports/{port_id}/reservations", json=body)
     assert r.status_code == 201
     assert r.json()["departure_start"] == "2026-09-24T00:36:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# 预约水深复核 GET /reservations/{id}/depth-audit
+# ---------------------------------------------------------------------------
+
+
+def _create_reservation(client, port_id):
+    r = client.post(f"/ports/{port_id}/reservations", json=RESERVATION_BODY)
+    assert r.status_code == 201
+    return r.json()["id"]
+
+
+def test_depth_audit_sufficient_when_forecast_unchanged(client):
+    port_id = _setup_port(client)
+    rid = _create_reservation(client, port_id)
+
+    r = client.get(f"/reservations/{rid}/depth-audit")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["reservation_id"] == rid
+    assert body["port_id"] == port_id
+    assert body["ship_name"] == "远洋号"
+    assert body["status"] == "active"
+    assert body["departure_start"] == "2026-09-24T00:36:00+00:00"
+    assert body["departure_end"] == "2026-09-24T01:36:00+00:00"
+    assert body["required_depth"] == 5.5
+    assert body["coverage_complete"] is True
+    assert body["uncovered"] == []
+    assert body["deficits"] == []
+    assert body["sufficient"] is True
+
+
+def test_depth_audit_reflects_latest_forecast_and_stays_read_only(client):
+    port_id = _setup_port(client)
+    rid = _create_reservation(client, port_id)
+
+    # 更正高潮预报点 3.0 → 1.0：通航区间 [00:36, 01:36] 内水深 5.1→5.27，
+    # 全程低于所需 5.5，最大欠深在 00:36（5.5 − 5.1 = 0.4）
+    client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [{"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 1.0}]},
+    )
+    body = client.get(f"/reservations/{rid}/depth-audit").json()
+    assert body["coverage_complete"] is True
+    assert body["uncovered"] == []
+    assert body["deficits"] == [
+        {
+            "start": "2026-09-24T00:36:00+00:00",
+            "end": "2026-09-24T01:36:00+00:00",
+            "max_deficit": 0.4,
+        }
+    ]
+    assert body["sufficient"] is False
+
+    # 复核只读：预约的排定时刻与状态不受影响
+    listed = client.get(f"/ports/{port_id}/reservations").json()
+    assert len(listed) == 1
+    assert listed[0]["id"] == rid
+    assert listed[0]["departure_start"] == "2026-09-24T00:36:00+00:00"
+    assert listed[0]["departure_end"] == "2026-09-24T01:36:00+00:00"
+    assert listed[0]["status"] == "active"
+
+
+def test_depth_audit_reports_uncovered_when_forecast_range_shrinks(client):
+    port_id = _setup_port(client)
+    rid = _create_reservation(client, port_id)
+
+    # 模拟预报覆盖收缩（如外部系统清理旧预报点）：删掉 03:00/06:00 点，
+    # 再补一个 01:00 点 → 预报只覆盖 [00:00, 01:00]，通航到 01:36
+    conn = sqlite3.connect(database.DATABASE_PATH)
+    conn.execute(
+        "DELETE FROM tide_forecasts WHERE forecast_time IN (?, ?)",
+        ("2026-09-24T03:00:00+00:00", "2026-09-24T06:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+    client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [{"forecast_time": "2026-09-24T01:00:00Z", "tide_height": 1.0}]},
+    )
+
+    body = client.get(f"/reservations/{rid}/depth-audit").json()
+    # 覆盖不足：不得判为安全
+    assert body["coverage_complete"] is False
+    assert body["sufficient"] is False
+    assert body["uncovered"] == [
+        {"start": "2026-09-24T01:00:00+00:00", "end": "2026-09-24T01:36:00+00:00"}
+    ]
+    # 覆盖段 [00:36, 01:00] 内水深 5.3→5.5：00:36 起欠深，01:00 恰好达标
+    assert body["deficits"] == [
+        {
+            "start": "2026-09-24T00:36:00+00:00",
+            "end": "2026-09-24T01:00:00+00:00",
+            "max_deficit": 0.2,
+        }
+    ]
+
+
+def test_depth_audit_cancelled_reservation_still_auditable(client):
+    port_id = _setup_port(client)
+    rid = _create_reservation(client, port_id)
+    assert client.delete(f"/reservations/{rid}").status_code == 200
+
+    body = client.get(f"/reservations/{rid}/depth-audit").json()
+    assert body["status"] == "cancelled"
+    assert body["sufficient"] is True  # 预报未变，排定区间水深仍达标
+
+
+def test_depth_audit_unknown_reservation_404(client):
+    assert client.get("/reservations/999/depth-audit").status_code == 404
