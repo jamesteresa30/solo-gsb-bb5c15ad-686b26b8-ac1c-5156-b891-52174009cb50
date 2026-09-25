@@ -6,9 +6,16 @@
 - 只在预报覆盖时段 [首个预报点, 末个预报点] 内计算；
 - 水深 >= 吃水 + 安全富余 的连续时段为达标窗口，端点恰好达标也纳入；
 - 可出发时段 = [窗口起点, 窗口终点 − 通航时长]；窗口长度不足通航时长的舍弃。
+
+预约水深复核（depth_deficit_audit）：
+- 对已排定的通航区间按最新预报点线性插值复算水深；
+- 区间内水深 < 所需水深 的连续时段合并为欠深段，并给出各段最大欠深；
+- 预报首末点未覆盖到的通航时段单独作为“未覆盖时段”返回，
+  不插值、不外推，也绝不能判为安全。
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 _EPS = 1e-9  # 浮点容差，保证“恰好达标”的端点被纳入
@@ -145,3 +152,138 @@ def earliest_scheduled_departure(
 def _to_utc(ts: float) -> datetime:
     """Unix 秒转 UTC datetime，四舍五入到整秒避免浮点噪声。"""
     return datetime.fromtimestamp(round(ts), tz=timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# 预约水深复核
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DepthAudit:
+    """通航区间水深复核结果（时间均为 Unix 秒）。
+
+    - deficits：水深严格低于所需水深的连续时段 [(start, end, max_shortfall)]，
+      max_shortfall = 该段内（所需水深 − 实际水深）的最大值（米）；
+    - uncovered：预报首末点未覆盖到的通航时段 [(start, end)]，
+      这些时段无法复算水深，不代表安全。
+    """
+
+    deficits: list[tuple[float, float, float]]
+    uncovered: list[tuple[float, float]]
+
+    @property
+    def fully_covered(self) -> bool:
+        return not self.uncovered
+
+    @property
+    def safe(self) -> bool:
+        """全覆盖且无欠深段才可判为安全。"""
+        return self.fully_covered and not self.deficits
+
+
+def _interpolate_depth(
+    ts: list[float], depths: list[float], t: float
+) -> float:
+    """相邻预报点间线性插值求 t 处水深；t 恰在预报点上时取该点值。"""
+    for i in range(len(ts) - 1):
+        if ts[i] - _EPS <= t <= ts[i + 1] + _EPS:
+            if t <= ts[i] + _EPS:
+                return depths[i]
+            if t >= ts[i + 1] - _EPS:
+                return depths[i + 1]
+            frac = (t - ts[i]) / (ts[i + 1] - ts[i])
+            return depths[i] + frac * (depths[i + 1] - depths[i])
+    raise ValueError("t 超出预报覆盖范围")  # pragma: no cover - 调用方保证
+
+
+def depth_deficit_audit(
+    points: list[ForecastPoint],
+    reference_depth: float,
+    required_depth: float,
+    interval_start: datetime,
+    interval_end: datetime,
+) -> DepthAudit:
+    """复核已排定通航区间 [interval_start, interval_end] 的水深。
+
+    实际水深 = reference_depth + 潮高，相邻预报点间线性插值。仅在预报覆盖时段
+    [首点, 末点] 内可计算；通航区间落在覆盖范围外的部分作为未覆盖时段返回。
+    水深 < required_depth 的连续时段合并为欠深段（恰等于所需水深不算欠深）。
+    """
+    start_ts, end_ts = interval_start.timestamp(), interval_end.timestamp()
+
+    # 预报点不足 2 个：没有任何可插值区间，整个通航时段均未覆盖
+    if len(points) < 2:
+        return DepthAudit(deficits=[], uncovered=[(start_ts, end_ts)])
+
+    ts = [p[0].timestamp() for p in points]
+    depths = [reference_depth + p[1] for p in points]
+    cov_start, cov_end = ts[0], ts[-1]
+
+    # 预报覆盖范围与通航区间的交集（含端点相接）；其余为未覆盖时段
+    covered_lo, covered_hi = max(start_ts, cov_start), min(end_ts, cov_end)
+    uncovered: list[tuple[float, float]] = []
+    if start_ts < cov_start - _EPS:
+        uncovered.append((start_ts, min(end_ts, cov_start)))
+    if end_ts > cov_end + _EPS:
+        uncovered.append((max(start_ts, cov_end), end_ts))
+
+    deficits: list[tuple[float, float, float]] = []
+    if covered_lo <= covered_hi + _EPS:
+        cur_start: float | None = None
+        cur_end: float | None = None
+        cur_shortfall: float = 0.0
+
+        def flush() -> None:
+            nonlocal cur_start, cur_end, cur_shortfall
+            if cur_start is not None and cur_end - cur_start > _EPS:
+                deficits.append((cur_start, cur_end, cur_shortfall))  # type: ignore[arg-type]
+            cur_start = cur_end = None
+            cur_shortfall = 0.0
+
+        # 逐段处理与覆盖交集相交的每个插值区间
+        for i in range(len(points) - 1):
+            seg_lo = max(ts[i], covered_lo)
+            seg_hi = min(ts[i + 1], covered_hi)
+            if seg_lo > seg_hi + _EPS:
+                continue
+            d_lo = _interpolate_depth(ts, depths, seg_lo)
+            d_hi = _interpolate_depth(ts, depths, seg_hi)
+            below_lo = d_lo < required_depth - _EPS
+            below_hi = d_hi < required_depth - _EPS
+
+            if not below_lo and not below_hi:
+                # 整段达标（线性段两端都不欠深则全程不欠深）：关闭当前欠深段
+                flush()
+                continue
+
+            if below_lo and below_hi:
+                low_lo, low_hi = seg_lo, seg_hi
+            elif below_lo:
+                # 由欠深升到达标：欠深到交点为止（交点恰好达标，归入安全侧）
+                cross = _cross_time(ts[i], depths[i], ts[i + 1], depths[i + 1], required_depth)
+                low_lo, low_hi = seg_lo, min(seg_hi, cross)
+            else:
+                cross = _cross_time(ts[i], depths[i], ts[i + 1], depths[i + 1], required_depth)
+                low_lo, low_hi = max(seg_lo, cross), seg_hi
+
+            if low_hi - low_lo <= _EPS:
+                continue
+            # 线性段内欠深量（required − depth）也是线性的，最大欠深在端点
+            shortfall = max(
+                0.0,
+                required_depth - _interpolate_depth(ts, depths, low_lo),
+                required_depth - _interpolate_depth(ts, depths, low_hi),
+            )
+            if cur_start is None:
+                cur_start, cur_end, cur_shortfall = low_lo, low_hi, shortfall
+            elif low_lo <= cur_end + 1e-6:  # type: ignore[operator]
+                # 相邻欠深段首尾相接，合并并取全段最大欠深
+                cur_end = max(cur_end, low_hi)  # type: ignore[type-var]
+                cur_shortfall = max(cur_shortfall, shortfall)
+            else:
+                flush()
+                cur_start, cur_end, cur_shortfall = low_lo, low_hi, shortfall
+
+        flush()
+
+    return DepthAudit(deficits=deficits, uncovered=uncovered)

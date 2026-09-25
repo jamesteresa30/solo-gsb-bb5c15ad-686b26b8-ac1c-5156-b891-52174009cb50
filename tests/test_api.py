@@ -1,5 +1,7 @@
 """API 端到端测试（需要 fastapi/httpx，容器内或安装依赖后运行）。"""
+import sqlite3
 import threading
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -284,3 +286,152 @@ def test_reservation_naive_datetime_treated_as_utc(client):
     r = client.post(f"/ports/{port_id}/reservations", json=body)
     assert r.status_code == 201
     assert r.json()["departure_start"] == "2026-09-24T00:36:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# 预约水深复核 GET /reservations/{id}/depth-audit
+# ---------------------------------------------------------------------------
+
+def test_depth_audit_safe_reservation(client):
+    port_id = _setup_port(client)
+    rid = client.post(f"/ports/{port_id}/reservations", json=RESERVATION_BODY).json()["id"]
+
+    r = client.get(f"/reservations/{rid}/depth-audit")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["reservation_id"] == rid
+    assert body["port_id"] == port_id
+    assert body["reference_depth"] == 4.5
+    assert body["required_depth"] == 5.5
+    assert body["transit_start"] == "2026-09-24T00:36:00+00:00"
+    assert body["transit_end"] == "2026-09-24T01:36:00+00:00"
+    assert body["forecast_point_count"] == 3
+    assert body["fully_covered"] is True
+    assert body["safe"] is True
+    assert body["deficit_segments"] == []
+    assert body["uncovered_intervals"] == []
+    assert body["audited_at"].endswith("+00:00")
+
+
+def test_depth_audit_reports_deficit_after_forecast_correction(client):
+    port_id = _setup_port(client)
+    rid = client.post(f"/ports/{port_id}/reservations", json=RESERVATION_BODY).json()["id"]
+
+    # 把首点 00:00 的潮高 0.5 → 0.0：00:00 水深 4.5，上升段斜率 1 米/小时，
+    # 到 01:00 水深才达 5.5；复核区间 [00:36, 01:36] 的 [00:36, 01:00] 欠深，
+    # 起点 00:36 水深 5.1，最大欠深 5.5 − 5.1 = 0.4
+    r = client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [{"forecast_time": "2026-09-24T00:00:00Z", "tide_height": 0.0}]},
+    )
+    assert r.status_code == 200
+
+    body = client.get(f"/reservations/{rid}/depth-audit").json()
+    assert body["safe"] is False
+    assert body["fully_covered"] is True
+    assert len(body["deficit_segments"]) == 1
+    seg = body["deficit_segments"][0]
+    assert seg["start"] == "2026-09-24T00:36:00+00:00"
+    assert seg["end"] == "2026-09-24T01:00:00+00:00"
+    assert seg["max_shortfall"] == pytest.approx(0.4, abs=1e-6)
+
+
+def test_depth_audit_unknown_reservation_404(client):
+    assert client.get("/reservations/999/depth-audit").status_code == 404
+
+
+def test_depth_audit_is_read_only(client):
+    port_id = _setup_port(client)
+    created = client.post(f"/ports/{port_id}/reservations", json=RESERVATION_BODY).json()
+    rid = created["id"]
+
+    client.get(f"/reservations/{rid}/depth-audit")
+    client.get(f"/reservations/{rid}/depth-audit")
+    # 预约本身与排程时刻不变
+    listed = client.get(f"/ports/{port_id}/reservations").json()
+    assert len(listed) == 1
+    assert listed[0]["departure_start"] == created["departure_start"]
+    assert listed[0]["departure_end"] == created["departure_end"]
+
+
+def test_depth_audit_works_for_cancelled_reservation(client):
+    port_id = _setup_port(client)
+    rid = client.post(f"/ports/{port_id}/reservations", json=RESERVATION_BODY).json()["id"]
+    assert client.delete(f"/reservations/{rid}").status_code == 200
+    # 已取消的预约仍可按其历史排程复核
+    r = client.get(f"/reservations/{rid}/depth-audit")
+    assert r.status_code == 200
+    assert r.json()["reservation_id"] == rid
+
+
+def _insert_reservation_outside_coverage(port_id: int) -> int:
+    """直接落库一条通航区间落在预报覆盖范围之外的预约。"""
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(database.DATABASE_PATH) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO reservations (
+                port_id, ship_name, draft, safety_margin, duration_minutes,
+                allowed_departure_from, allowed_departure_to,
+                departure_start, departure_end, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                port_id, "越界船", 5.0, 0.5, 90,
+                "2026-09-24T05:30:00+00:00", "2026-09-24T06:30:00+00:00",
+                "2026-09-24T05:30:00+00:00", "2026-09-24T07:00:00+00:00",
+                "active", now,
+            ),
+        )
+        return cur.lastrowid
+
+
+def test_depth_audit_uncovered_interval_is_not_safe(client):
+    port_id = _setup_port(client)
+    rid = _insert_reservation_outside_coverage(port_id)
+
+    body = client.get(f"/reservations/{rid}/depth-audit").json()
+    # 预报只覆盖到 06:00：[05:30, 06:00] 可复算（水深由 6.875 降到 5.0，欠深），
+    # [06:00, 07:00] 未覆盖——即使前段达标也不能判安全
+    assert body["fully_covered"] is False
+    assert body["safe"] is False
+    assert body["uncovered_intervals"] == [
+        {"start": "2026-09-24T06:00:00+00:00", "end": "2026-09-24T07:00:00+00:00"}
+    ]
+    # [05:30, 06:00] 水深 6.875 → 5.0，要求 5.5：交点之后欠深，最大欠深在 06:00
+    assert len(body["deficit_segments"]) == 1
+    seg = body["deficit_segments"][0]
+    assert seg["end"] == "2026-09-24T06:00:00+00:00"
+    assert seg["max_shortfall"] == pytest.approx(0.5, abs=1e-6)
+
+
+def test_depth_audit_entire_interval_uncovered(client):
+    # 无任何预报点的港口：整条通航区间未覆盖
+    port_id = client.post("/ports", json={"name": "空港", "reference_depth": 10.0}).json()["id"]
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(database.DATABASE_PATH) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO reservations (
+                port_id, ship_name, draft, safety_margin, duration_minutes,
+                allowed_departure_from, allowed_departure_to,
+                departure_start, departure_end, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                port_id, "无预报船", 5.0, 0.5, 60,
+                "2026-09-24T00:00:00+00:00", "2026-09-24T02:00:00+00:00",
+                "2026-09-24T00:00:00+00:00", "2026-09-24T01:00:00+00:00",
+                "active", now,
+            ),
+        )
+        rid = cur.lastrowid
+
+    body = client.get(f"/reservations/{rid}/depth-audit").json()
+    assert body["forecast_point_count"] == 0
+    assert body["fully_covered"] is False
+    assert body["safe"] is False
+    assert body["deficit_segments"] == []
+    assert body["uncovered_intervals"] == [
+        {"start": "2026-09-24T00:00:00+00:00", "end": "2026-09-24T01:00:00+00:00"}
+    ]

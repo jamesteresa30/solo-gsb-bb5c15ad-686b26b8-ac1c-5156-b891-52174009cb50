@@ -7,6 +7,9 @@
 - 单向航道预约：在请求的允许出发范围内，按最新预报安排最早出发时刻，
   整个通航过程不与该港口有效预约重叠（首尾相接允许）；无可用时刻返回 409；
   已落库预约记录确定时刻，预报更正不追溯调整/取消已有预约。
+- 预约水深复核：读取预约已排定的通航起止、吃水和安全富余，按该港口最新预报
+  线性插值复算水深，返回欠深连续段及各段最大欠深；预报未覆盖时段单独标明，
+  不视为安全。复核为只读操作，不改动预约或原排程。
 """
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -17,6 +20,8 @@ from sqlite3 import Connection
 from .database import get_db, init_db, locked_reservation_tx, port_lock
 from .schemas import (
     DepartureWindow,
+    DepthAuditResult,
+    DepthDeficitSegment,
     PortCreate,
     PortOut,
     PortUpdate,
@@ -24,10 +29,11 @@ from .schemas import (
     ReservationOut,
     TideForecastOut,
     TideForecastUpsert,
+    UncoveredInterval,
     WindowQuery,
     WindowQueryResult,
 )
-from .tides import departure_windows, earliest_scheduled_departure
+from .tides import departure_windows, depth_deficit_audit, earliest_scheduled_departure
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -323,3 +329,65 @@ def cancel_reservation(reservation_id: int, db: Connection = Depends(get_db)):
         "SELECT * FROM reservations WHERE id = ?", (reservation_id,)
     ).fetchone()
     return _reservation_from_row(row)
+
+
+@app.get("/reservations/{reservation_id}/depth-audit", response_model=DepthAuditResult)
+def reservation_depth_audit(reservation_id: int, db: Connection = Depends(get_db)):
+    """预约水深复核（只读）。
+
+    读取预约已排定的通航起止 [departure_start, departure_end]、吃水与安全富余，
+    按该港口**查询时最新**潮高预报，在相邻预报点间线性插值复算实际水深
+    （基准水深 + 潮高），将通航区间内水深严格低于所需水深（吃水 + 安全富余）
+    的连续时段合并返回，并给出各段最大欠深。
+
+    预报首末点未覆盖整个通航区间时，未覆盖部分在 ``uncovered_intervals`` 中
+    明确返回且 ``fully_covered=false``、``safe=false``——未覆盖不等于安全，
+    不做任何外推。结果只反映本次查询时的预报，**不改动预约或原排程**
+    （已取消的预约也可复核其历史排程）。
+    """
+    row = db.execute(
+        "SELECT * FROM reservations WHERE id = ?", (reservation_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"预约 {reservation_id} 不存在")
+
+    port = _get_port_or_404(db, row["port_id"])
+    points = _forecast_points(db, row["port_id"])
+    transit_start = datetime.fromisoformat(row["departure_start"])
+    transit_end = datetime.fromisoformat(row["departure_end"])
+    required_depth = row["draft"] + row["safety_margin"]
+
+    audit = depth_deficit_audit(
+        points,
+        reference_depth=port["reference_depth"],
+        required_depth=required_depth,
+        interval_start=transit_start,
+        interval_end=transit_end,
+    )
+    return DepthAuditResult(
+        reservation_id=reservation_id,
+        port_id=row["port_id"],
+        reference_depth=port["reference_depth"],
+        required_depth=required_depth,
+        transit_start=transit_start,
+        transit_end=transit_end,
+        forecast_point_count=len(points),
+        fully_covered=audit.fully_covered,
+        safe=audit.safe,
+        deficit_segments=[
+            DepthDeficitSegment(
+                start=datetime.fromtimestamp(round(s), tz=timezone.utc),
+                end=datetime.fromtimestamp(round(e), tz=timezone.utc),
+                max_shortfall=shortfall,
+            )
+            for s, e, shortfall in audit.deficits
+        ],
+        uncovered_intervals=[
+            UncoveredInterval(
+                start=datetime.fromtimestamp(round(s), tz=timezone.utc),
+                end=datetime.fromtimestamp(round(e), tz=timezone.utc),
+            )
+            for s, e in audit.uncovered
+        ],
+        audited_at=datetime.now(timezone.utc),
+    )

@@ -1,7 +1,14 @@
 """核心窗口计算算法的单元测试（仅标准库）。"""
 from datetime import datetime, timedelta, timezone
 
-from app.tides import departure_windows, earliest_scheduled_departure, sufficient_depth_windows
+import pytest
+
+from app.tides import (
+    departure_windows,
+    depth_deficit_audit,
+    earliest_scheduled_departure,
+    sufficient_depth_windows,
+)
 
 BASE = datetime(2026, 9, 24, tzinfo=timezone.utc)
 
@@ -206,3 +213,133 @@ def test_schedule_range_touching_tide_window_endpoint_allowed():
         [],
     )
     assert dep == BASE + timedelta(hours=4)
+
+
+# ---------------------------------------------------------------------------
+# depth_deficit_audit：预约水深复核
+# ---------------------------------------------------------------------------
+
+def _audit(heights, start, end, reference_depth=3.0, required=5.0, step_minutes=60):
+    return depth_deficit_audit(
+        pts(*heights, step_minutes=step_minutes),
+        reference_depth=reference_depth,
+        required_depth=required,
+        interval_start=BASE + timedelta(minutes=start),
+        interval_end=BASE + timedelta(minutes=end),
+    )
+
+
+def test_audit_safe_whole_covered_interval():
+    # 水深 4→6→4，要求 5；复核 [00:30, 01:30] 恰好是达标窗口 → 安全
+    a = _audit((1, 3, 1), 30, 90)
+    assert a.fully_covered is True
+    assert a.deficits == []
+    assert a.uncovered == []
+    assert a.safe is True
+
+
+def test_audit_deficit_at_start_with_max_shortfall():
+    # 水深 4→6→4，要求 5；复核 [00:00, 01:00]：
+    # [00:00, 00:30] 欠深，最大欠深在 00:00：5 − 4 = 1
+    a = _audit((1, 3, 1), 0, 60)
+    assert a.fully_covered is True
+    assert len(a.deficits) == 1
+    s, e, shortfall = a.deficits[0]
+    assert s == BASE.timestamp()
+    assert e == (BASE + timedelta(minutes=30)).timestamp()
+    assert shortfall == pytest.approx(1.0)
+    assert a.safe is False
+
+
+def test_audit_merges_touching_deficit_segments():
+    # 潮高 1,3,1,3,1（水深 4,6,4,6,4），要求 5：两个欠深段 [01:30,02:30] 与两侧
+    # 复核 [00:30, 03:30]：[01:30,02:30] 为欠深（谷值水深 4，最大欠深 1）
+    a = _audit((1, 3, 1, 3, 1), 30, 210)
+    assert a.uncovered == []
+    assert len(a.deficits) == 1
+    s, e, shortfall = a.deficits[0]
+    assert s == (BASE + timedelta(hours=1, minutes=30)).timestamp()
+    assert e == (BASE + timedelta(hours=2, minutes=30)).timestamp()
+    assert shortfall == pytest.approx(1.0)
+
+
+def test_audit_multiple_separate_deficits():
+    # 复核 [00:00, 04:00]：欠深段 [00:00,00:30] 与 [01:30,02:30] 与 [03:30,04:00]
+    a = _audit((1, 3, 1, 3, 1), 0, 240)
+    assert len(a.deficits) == 3
+    bounds = [
+        (BASE + timedelta(minutes=0), BASE + timedelta(minutes=30)),
+        (BASE + timedelta(hours=1, minutes=30), BASE + timedelta(hours=2, minutes=30)),
+        (BASE + timedelta(hours=3, minutes=30), BASE + timedelta(hours=4)),
+    ]
+    for (s, e, shortfall), (bs, be) in zip(a.deficits, bounds):
+        assert s == bs.timestamp()
+        assert e == be.timestamp()
+        assert shortfall == pytest.approx(1.0)
+    assert a.safe is False
+
+
+def test_audit_exact_threshold_not_a_deficit():
+    # 水深全程恰好等于要求值 → 不算欠深
+    a = _audit((2, 2), 0, 60, required=5.0)
+    assert a.deficits == []
+    assert a.safe is True
+
+
+def test_audit_interval_ends_before_forecast_start_uncovered():
+    # 通航区间 [−2h, −1h] 完全在预报首点（00:00）之前 → 整段未覆盖，不能判安全
+    a = _audit((1, 3, 1), -120, -60)
+    assert a.fully_covered is False
+    assert a.safe is False
+    assert a.deficits == []
+    assert a.uncovered == [
+        ((BASE - timedelta(hours=2)).timestamp(), (BASE - timedelta(hours=1)).timestamp())
+    ]
+
+
+def test_audit_interval_partial_uncovered_before_and_after():
+    # 预报覆盖 [00:00, 02:00]，通航 [−1h, 03:00]：
+    # 未覆盖 [−1h,00:00]、[02:00,03:00]；中间 [00:00,02:00] 水深 4→6→4
+    # 欠深 [00:00,00:30] 与 [01:30,02:00]
+    a = _audit((1, 3, 1), -60, 180)
+    assert a.fully_covered is False
+    assert a.safe is False
+    assert a.uncovered == [
+        ((BASE - timedelta(hours=1)).timestamp(), BASE.timestamp()),
+        ((BASE + timedelta(hours=2)).timestamp(), (BASE + timedelta(hours=3)).timestamp()),
+    ]
+    assert len(a.deficits) == 2
+
+
+def test_audit_uncovered_even_when_covered_part_is_safe():
+    # 已覆盖部分全程达标，但尾部超出预报末点 → 仍不能判安全
+    a = _audit((3, 4, 3), 30, 150)  # 覆盖到 02:00，通航到 02:30
+    assert a.deficits == []
+    assert a.fully_covered is False
+    assert a.safe is False
+    assert a.uncovered == [
+        ((BASE + timedelta(hours=2)).timestamp(), (BASE + timedelta(hours=2, minutes=30)).timestamp())
+    ]
+
+
+def test_audit_fewer_than_two_points_entire_interval_uncovered():
+    a = depth_deficit_audit(
+        pts(5.0),
+        reference_depth=3.0,
+        required_depth=5.0,
+        interval_start=BASE,
+        interval_end=BASE + timedelta(hours=1),
+    )
+    assert a.deficits == []
+    assert a.fully_covered is False
+    assert a.safe is False
+    assert a.uncovered == [
+        (BASE.timestamp(), (BASE + timedelta(hours=1)).timestamp())
+    ]
+
+
+def test_audit_coverage_boundary_touching_counts_as_covered():
+    # 通航区间恰好等于预报覆盖范围 [00:00, 02:00] → 完全覆盖
+    a = _audit((1, 3, 1), 0, 120)
+    assert a.fully_covered is True
+    assert a.uncovered == []

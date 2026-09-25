@@ -12,6 +12,9 @@
 - **单向航道预约**：在请求方允许的出发时刻范围内，按最新预报安排**最早**出发时刻，
   使整个通航过程不与该港口现有**有效预约**重叠（两船**首尾相接允许**）；
   无可用时刻返回 **409** 且不写入；同港口并发创建原子地“检查 + 落库”，杜绝双重占用；
+- **预约水深复核**：`GET /reservations/{id}/depth-audit` 按查询时最新预报，
+  对预约已排定的通航区间线性插值复算水深，返回欠深连续段及各段最大欠深；
+  预报未覆盖时段单独标明（不视为安全）；只读，不改动预约或原排程；
 - 已落库预约记录的是排定的确定时刻，**预报更正不追溯调整或取消已有预约**。
 
 ## 快速开始（单条命令）
@@ -53,6 +56,7 @@ docker compose up --build
 | `POST` | `/ports/{id}/windows` | 提交吃水、安全富余、通航时长，计算可出发时段 |
 | `POST` | `/ports/{id}/reservations` | 创建单向航道预约（自动排最早出发时刻） |
 | `GET` | `/ports/{id}/reservations` | 按港口列出**有效**预约（按出发时刻升序） |
+| `GET` | `/reservations/{id}/depth-audit` | 预约水深复核：按最新预报复算排定通航区间的水深（只读） |
 | `DELETE` | `/reservations/{id}` | 取消预约（释放航道占用） |
 
 ### 完整示例
@@ -195,6 +199,90 @@ curl -X DELETE http://localhost:8000/reservations/1
 - 取消后的预约状态变为 `cancelled`，不再占用航道、不出现在有效列表中；
 - 创建预约的校验与 `/windows` 一致（通航时长为正、吃水/富余非负），
   此外允许出发范围起止颠倒返回 422，港口不存在返回 404。
+
+## 预约水深复核
+
+预约落库后预报可能被更正。`GET /reservations/{id}/depth-audit` 对一条预约
+（含已取消预约的历史排程）做事后只读复核：
+
+1. 读取该预约**已排定**的通航区间 `[departure_start, departure_end]`、
+   吃水与安全富余（所需水深 = 吃水 + 安全富余）；
+2. 读取该港口**查询时最新**潮高预报，相邻预报点间按**线性插值**复算实际水深
+   （基准水深 + 潮高）；
+3. 将通航区间内水深**低于**所需水深的连续时段**合并**后返回，每段给出
+   **最大欠深**（米，= 所需水深 − 实际水深的段内最大值）；水深恰好等于所需水深不算欠深；
+4. 预报首末点**未覆盖**整个通航区间时，未覆盖部分在 `uncovered_intervals`
+   中逐段明确返回，`fully_covered=false` 且 `safe=false`——**未覆盖不等于安全**，
+   不做任何外推，即使已覆盖部分全程达标也不能判为安全；
+5. 结果只反映本次查询时的预报（响应含 `audited_at`），**不改动预约或原排程**；
+   预约不存在返回 404。
+
+```bash
+# 复核预约 1（排定 00:36–01:36，所需水深 5.5）
+curl http://localhost:8000/reservations/1/depth-audit
+```
+
+全程达标且预报完整覆盖时：
+
+```json
+{
+  "reservation_id": 1,
+  "port_id": 1,
+  "reference_depth": 4.5,
+  "required_depth": 5.5,
+  "transit_start": "2026-09-24T00:36:00+00:00",
+  "transit_end": "2026-09-24T01:36:00+00:00",
+  "forecast_point_count": 3,
+  "fully_covered": true,
+  "safe": true,
+  "deficit_segments": [],
+  "uncovered_intervals": [],
+  "audited_at": "2026-09-25T08:00:00+00:00"
+}
+```
+
+若预报更正后前段水深不足（例：把 00:00 潮高改为 0.0，上升段 01:00 才达 5.5）：
+
+```json
+{
+  "reservation_id": 1,
+  "port_id": 1,
+  "reference_depth": 4.5,
+  "required_depth": 5.5,
+  "transit_start": "2026-09-24T00:36:00+00:00",
+  "transit_end": "2026-09-24T01:36:00+00:00",
+  "forecast_point_count": 3,
+  "fully_covered": true,
+  "safe": false,
+  "deficit_segments": [
+    {
+      "start": "2026-09-24T00:36:00+00:00",
+      "end": "2026-09-24T01:00:00+00:00",
+      "max_shortfall": 0.4
+    }
+  ],
+  "uncovered_intervals": [],
+  "audited_at": "2026-09-25T08:05:00+00:00"
+}
+```
+
+若通航区间延伸到预报末点之后（预报只到 `06:00`，通航到 `07:00`），
+未覆盖时段单独列出且 `safe=false`，不会被当作安全：
+
+```json
+{
+  "fully_covered": false,
+  "safe": false,
+  "deficit_segments": [
+    {"start": "2026-09-24T05:30:00+00:00", "end": "2026-09-24T06:00:00+00:00", "max_shortfall": 0.5}
+  ],
+  "uncovered_intervals": [
+    {"start": "2026-09-24T06:00:00+00:00", "end": "2026-09-24T07:00:00+00:00"}
+  ]
+}
+```
+
+预报点不足 2 个（无插值区间）时，整个通航区间均作为未覆盖时段返回。
 
 ## 本地开发（不用 Docker）
 

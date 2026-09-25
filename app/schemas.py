@@ -104,3 +104,46 @@ class ReservationOut(BaseModel):
     status: str = Field(description="状态：active / cancelled")
     created_at: UtcDatetime
     canceled_at: UtcDatetime | None = None
+
+
+class DepthDeficitSegment(BaseModel):
+    """通航区间内水深低于所需水深的一段连续时段。"""
+
+    start: UtcDatetime = Field(description="欠深时段起点")
+    end: UtcDatetime = Field(description="欠深时段终点")
+    max_shortfall: float = Field(
+        description="该段最大欠深（米）= 所需水深 − 实际水深 的最大值；> 0"
+    )
+
+
+class UncoveredInterval(BaseModel):
+    """通航区间内未被预报首末点覆盖、无法复算水深的时段。"""
+
+    start: UtcDatetime = Field(description="未覆盖时段起点")
+    end: UtcDatetime = Field(description="未覆盖时段终点")
+
+
+class DepthAuditResult(BaseModel):
+    """预约水深复核结果（GET /reservations/{id}/depth-audit）。
+
+    仅反映查询时刻数据库中的最新预报，为只读复核：不改动预约与原排程。
+    safe 仅在预报完整覆盖整个通航区间且无欠深段时为 true；
+    存在未覆盖时段时即使已覆盖部分水深达标也不能判为安全。
+    """
+
+    reservation_id: int
+    port_id: int
+    reference_depth: float = Field(description="该港口航道基准水深（米）")
+    required_depth: float = Field(description="所需水深 = 吃水 + 安全富余（米）")
+    transit_start: UtcDatetime = Field(description="复核的通航区间起点（预约排定的出发时刻）")
+    transit_end: UtcDatetime = Field(description="复核的通航区间终点（预约排定的通航结束时刻）")
+    forecast_point_count: int = Field(description="查询时该港口最新预报点数量")
+    fully_covered: bool = Field(description="预报是否完整覆盖整个通航区间")
+    safe: bool = Field(description="全覆盖且无欠深段才为 true；覆盖不足恒为 false")
+    deficit_segments: list[DepthDeficitSegment] = Field(
+        description="水深低于所需水深的连续时段（已合并），按起点升序"
+    )
+    uncovered_intervals: list[UncoveredInterval] = Field(
+        description="预报未覆盖的通航时段（无法复算水深，不能视为安全），按起点升序"
+    )
+    audited_at: UtcDatetime = Field(description="复核执行时刻（UTC），结果仅代表该时刻的预报")
